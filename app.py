@@ -383,7 +383,9 @@ def lead_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
         })
     ag = pd.DataFrame(rows).sort_values("Reopen %", ascending=False)
     st.dataframe(ag.style.format({c: "{:.0f}" for c in ag.columns if "%" in c or "(h)" in c} | {"CSAT": "{:.2f}"})
-                 .background_gradient(subset=["Reopen %", "Escalation %"], cmap="Oranges"), hide_index=True, width="stretch")
+                 .map(lambda v: "background-color: rgba(217,146,43,.35)" if v >= 25 else "", subset=["Reopen %"])
+                 .map(lambda v: "background-color: rgba(217,146,43,.35)" if v >= 50 else "", subset=["Escalation %", "Returned % of escalations"]),
+                 hide_index=True, width="stretch")
     fast = ag.sort_values("Median close (h)").iloc[0]
     st.caption(f"Read this as a coaching aid, not a ranking. {fast['Agent']} closes fastest but is reopened {fast['Reopen %']:.0f}% of the time, "
                f"against {ag[ag['Agent'] != fast['Agent']]['Reopen %'].mean():.0f}% for the others.")

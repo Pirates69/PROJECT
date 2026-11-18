@@ -6,7 +6,9 @@ the L1 checklists, which are assumptions to be validated with engineering.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -263,9 +265,81 @@ def verdict(h: dict, issue_n: int) -> tuple[str, str, str]:
 # ----------------------------------------------------------------------------
 # Views
 # ----------------------------------------------------------------------------
+def session_log() -> list[dict]:
+    return st.session_state.setdefault("handoff_log", [])
+
+
+def apply_session(d: pd.DataFrame) -> pd.DataFrame:
+    """Reflect this session's handoffs in the ticket data (simulated engineering queue)."""
+    log = [h for h in session_log() if h["existing"]]
+    if not log:
+        return d
+    d = d.copy()
+    for h in log:
+        m = d["ticket_id"] == h["ticket"]
+        d.loc[m, "escalated_to_eng"] = "Yes"
+        d.loc[m, "esc"] = True
+        d.loc[m, "eng_ticket_id"] = h["eng_id"]
+        d.loc[m, "eng_handoffs"] = d.loc[m, "eng_handoffs"] + 1
+        d.loc[m, "status"] = "Open - with Engineering"
+    return d
+
+
+def next_ids(d: pd.DataFrame) -> tuple[str, str]:
+    eng = pd.concat([d["eng_ticket_id"].dropna(), pd.Series([h["eng_id"] for h in session_log()], dtype=str)])
+    eng_n = pd.to_numeric(eng.str.extract(r"(\d+)")[0], errors="coerce").max()
+    sup_n = pd.to_numeric(d["ticket_id"].str.extract(r"(\d+)")[0], errors="coerce").max()
+    new_sup = len([h for h in session_log() if not h["existing"]])
+    return f"ENG-{int(eng_n) + 1}", f"SUP-{int(sup_n) + 1 + new_sup}"
+
+
+def hand_off(d: pd.DataFrame, ticket: dict, note: str, override: bool) -> None:
+    eng_id, new_sup = next_ids(d)
+    existing = ticket["id"] != "SUP-NEW"
+    tid = ticket["id"] if existing else new_sup
+    when = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %b %H:%M")
+    session_log().append({
+        "time": when, "ticket": tid, "eng_id": eng_id, "client": ticket["client"], "category": ticket["category"],
+        "priority": ticket["priority"], "owner": ticket["owner"], "override": override, "existing": existing,
+        "handoff_no": ticket["handoffs"] + 1, "note": note,
+    })
+    st.session_state["last_handoff"] = f"{tid} handed off to engineering as {eng_id} at {when} IST. Status is now Open - with Engineering."
+
+
+def log_section() -> None:
+    log = session_log()
+    st.divider()
+    st.subheader("Handed off this session")
+    st.caption("v0 keeps this queue for the current session only. It is not connected to RideOps' engineering system.")
+    if not log:
+        st.info("No handoffs yet. Complete a ticket's checks above and press Hand off to Engineering.")
+        return
+    t = pd.DataFrame(log)
+    shown = t.rename(columns={"time": "Time (IST)", "ticket": "Ticket", "eng_id": "Eng ticket", "client": "Client", "category": "Category",
+                              "priority": "Priority", "owner": "Owner", "override": "Override", "handoff_no": "Handoff #"})
+    st.dataframe(shown[["Time (IST)", "Ticket", "Eng ticket", "Client", "Category", "Priority", "Handoff #", "Owner", "Override"]], hide_index=True, width="stretch")
+    c1, c2 = st.columns(2)
+    c1.download_button("Download handoff log (CSV)", t.to_csv(index=False).encode(), "handoff_log.csv", "text/csv")
+    updated = st.session_state.get("updated_csv")
+    if updated is not None:
+        c2.download_button("Download tickets CSV with these changes", updated, "rideops_support_tickets_updated.csv", "text/csv")
+
+
+def looks_like_text(text: str) -> bool:
+    """Light guard against keyboard mashing. It cannot judge whether the findings are true."""
+    words = [w.strip(".,;:()!?-").lower() for w in text.split()]
+    words = [w for w in words if w]
+    if len(words) < 5:
+        return False
+    plausible = sum(1 for w in words if len(w) <= 14 and any(v in w for v in "aeiou") and not any(w.count(ch) >= 4 for ch in set(w)))
+    return plausible / len(words) >= 0.6 and len(set(words)) >= 4
+
+
 def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
     st.title("L1 Escalation Gate")
     st.caption("Check what happened to similar tickets, finish the checklist, then hand off with a note engineering can act on.")
+    if msg := st.session_state.pop("last_handoff", None):
+        st.success(msg)
     mode = st.radio("Mode", ["Open tickets", "New ticket"], horizontal=True, label_visibility="collapsed")
 
     if mode == "Open tickets":
@@ -281,7 +355,8 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
             op = op[op["status"] == st_f]
         if ag_f != "All":
             op = op[op["assigned_agent"] == ag_f]
-        op = op.sort_values(["eng_handoffs", "age_h"], ascending=False)
+        op["_with_eng"] = op["status"].eq("Open - with Engineering")
+        op = op.sort_values(["_with_eng", "eng_handoffs", "age_h"], ascending=[True, False, False])
         if op.empty:
             st.info("No open tickets match these filters.")
             return
@@ -367,10 +442,10 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
         missing = []
         if not all(checks):
             missing.append(f"{checks.count(False)} checklist item(s)")
-        if not all(v.strip() for v in vals):
-            missing.append("identifiers")
-        if len(summary.strip()) < 10:
-            missing.append("investigation summary")
+        if not all(len(v.strip()) >= 3 for v in vals):
+            missing.append("identifiers (at least 3 characters each)")
+        if len(summary.split()) < 5 or len(summary.strip()) < 25 or not looks_like_text(summary):
+            missing.append("investigation summary (a sentence of at least 5 real words)")
         ready = not missing or override
 
         if ready:
@@ -392,10 +467,23 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
                     "If you return this, please name the one thing you need.",
                 ]
             )
-            st.success("Ready to hand off." if not missing else "Override on. Missing: " + ", ".join(missing) + ".")
-            st.code(note, language=None)
+            if ticket["status"] == "Open - with L1":
+                st.success("Ready to hand off." if not missing else "Override on. Missing: " + ", ".join(missing) + ".")
+                st.code(note, language=None, wrap_lines=True)
+                if st.button("Hand off to Engineering", type="primary", key=f"{key}-send"):
+                    hand_off(d, ticket, note, override and bool(missing))
+                    st.rerun()
+            else:
+                eng_id = next((h["eng_id"] for h in reversed(session_log()) if h["ticket"] == ticket["id"]), None)
+                st.info(f"Already with engineering{f' as {eng_id}' if eng_id else ''}. Chase for an ETA instead of escalating again.")
         else:
             st.warning("Handoff note locked. Still needed: " + ", ".join(missing) + ".")
+
+
+def _gate_footer(d: pd.DataFrame) -> None:
+    if session_log():
+        st.session_state["updated_csv"] = d[REQUIRED_COLUMNS].to_csv(index=False).encode()
+    log_section()
 
 
 def lead_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
@@ -523,6 +611,8 @@ def diagnosis_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
 st.sidebar.markdown("## RideOps Support Console")
 st.sidebar.caption("v0 · internal")
 df = load()
+if df is not None:
+    df = apply_session(df)
 if df is None:
     st.title("RideOps Support Console")
     st.info("Upload the ticket CSV in the sidebar to begin, or place it at `data/rideops_support_tickets.csv`.")
@@ -534,11 +624,13 @@ view = st.sidebar.radio("View", ["L1 Escalation Gate", "Lead Radar", "Diagnosis 
 op_now = int(df["is_open"].sum())
 st.sidebar.divider()
 st.sidebar.metric("Open tickets", op_now)
+st.sidebar.metric("Handed off this session", len(session_log()))
 st.sidebar.metric("Avoidable handoff rate", f"{df[df['esc']]['returned'].mean():.0%}", help="Escalations returned to L1 as config or missing info. Target below 15%.")
 st.sidebar.caption(f"{len(df):,} tickets · data to {(snapshot - pd.Timedelta(days=1)).date()}")
 
 if view == "L1 Escalation Gate":
     gate_view(df, snapshot)
+    _gate_footer(df)
 elif view == "Lead Radar":
     lead_view(df, snapshot)
 else:

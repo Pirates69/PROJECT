@@ -210,7 +210,7 @@ def weekly(d: pd.DataFrame, snapshot: pd.Timestamp) -> pd.DataFrame:
                 "Escalated": len(ee),
                 "Open at week end": int(open_end),
                 "Open ÷ weekly volume": open_end / max(len(w), 1),
-                "Avoidable handoff rate %": ee["returned"].mean() * 100 if len(ee) else None,
+                "Avoidable handoff rate %": ee[ee["eng_outcome"].notna()]["returned"].mean() * 100 if ee["eng_outcome"].notna().any() else None,
                 "Median final close, escalated (h)": ee["ttr_h"].median() if len(ee) else None,
                 "Reopen rate %": w["reopened"].mean() * 100,
                 "CSAT": w["csat_score"].mean(),
@@ -237,7 +237,7 @@ def history(d: pd.DataFrame, category: str, desc: str) -> dict:
     issue = d[(d["category"] == category) & (d["description"] == desc)]
     cat = d[d["category"] == category]
     scope, label = (issue, "this exact issue") if issue["esc"].sum() >= MIN_ISSUE_SAMPLE else (cat, "this category")
-    esc = scope[scope["esc"]]
+    esc = scope[scope["esc"] & scope["eng_outcome"].notna()]
     mix = esc["eng_outcome"].value_counts().reindex(OUTCOME_ORDER).fillna(0).astype(int)
     return {
         "issue": issue,

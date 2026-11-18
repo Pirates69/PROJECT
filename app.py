@@ -133,13 +133,62 @@ def prepare(raw: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+REQUIRED_COLUMNS = [
+    "ticket_id", "created_at", "channel", "client_id", "client_name", "client_tier", "category", "priority",
+    "description", "assigned_agent", "first_response_at", "escalated_to_eng", "eng_ticket_id", "eng_handoffs",
+    "eng_outcome", "status", "first_closed_at", "final_closed_at", "reopen_count", "csat_score",
+]
+
+
+def check_schema(raw: pd.DataFrame) -> list[str]:
+    """Return a list of blocking problems (empty list means the file is usable)."""
+    missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
+    if missing:
+        return [f"Missing columns: {', '.join(missing)}"]
+    problems = []
+    if raw.empty:
+        problems.append("The file has no rows.")
+    if not set(raw["escalated_to_eng"].dropna().unique()) <= {"Yes", "No"}:
+        problems.append("`escalated_to_eng` must contain only Yes or No.")
+    try:
+        pd.to_datetime(raw["created_at"])
+    except Exception:
+        problems.append("`created_at` could not be read as dates (expected like 2026-07-02 01:27).")
+    return problems
+
+
 def load() -> pd.DataFrame | None:
     up = st.sidebar.file_uploader("Ticket CSV", type="csv", help="Same columns as rideops_support_tickets.csv")
+    raw = None
     if up is not None:
-        return prepare(pd.read_csv(up))
-    if DATA_PATH.exists():
-        return prepare(pd.read_csv(DATA_PATH))
-    return None
+        try:
+            raw = pd.read_csv(up)
+        except Exception:
+            st.error("That file could not be read as a CSV. Please upload `rideops_support_tickets.csv` in its original format.")
+            st.stop()
+        source = "uploaded file"
+    elif DATA_PATH.exists():
+        raw = pd.read_csv(DATA_PATH)
+        source = "bundled file"
+    if raw is None:
+        return None
+    problems = check_schema(raw)
+    if problems:
+        st.title("RideOps Support Console")
+        st.error("This is not the RideOps ticket file the app expects. Please upload the correct CSV (`rideops_support_tickets.csv`).")
+        for p in problems:
+            st.markdown(f"- {p}")
+        st.caption(f"Columns found in the {source}: {', '.join(map(str, raw.columns))}")
+        st.stop()
+    d = prepare(raw)
+    unknown_cat = sorted(set(d["category"].dropna()) - set(CHECKLISTS))
+    unknown_out = sorted(set(d["eng_outcome"].dropna()) - set(OUTCOME_ORDER))
+    if unknown_cat or unknown_out:
+        st.sidebar.warning(
+            "Some values are new to this app and may be left out of checklists or outcome charts: "
+            + "; ".join(x for x in [f"categories {unknown_cat}" if unknown_cat else "", f"outcomes {unknown_out}" if unknown_out else ""] if x)
+        )
+    return d
 
 
 def weekly(d: pd.DataFrame, snapshot: pd.Timestamp) -> pd.DataFrame:

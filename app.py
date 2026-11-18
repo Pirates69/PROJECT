@@ -270,11 +270,15 @@ def session_log() -> list[dict]:
 
 
 def apply_session(d: pd.DataFrame) -> pd.DataFrame:
-    """Reflect this session's handoffs in the ticket data (simulated engineering queue)."""
-    log = [h for h in session_log() if h["existing"]]
-    if not log:
+    """Reflect this session's new tickets and handoffs in the data (simulated, session only)."""
+    new = st.session_state.get("new_tickets", [])
+    log = session_log()
+    if not new and not log:
         return d
     d = d.copy()
+    if new:
+        add = prepare(pd.DataFrame(new)[REQUIRED_COLUMNS])
+        d = pd.concat([d, add], ignore_index=True)
     for h in log:
         m = d["ticket_id"] == h["ticket"]
         d.loc[m, "escalated_to_eng"] = "Yes"
@@ -282,28 +286,37 @@ def apply_session(d: pd.DataFrame) -> pd.DataFrame:
         d.loc[m, "eng_ticket_id"] = h["eng_id"]
         d.loc[m, "eng_handoffs"] = d.loc[m, "eng_handoffs"] + 1
         d.loc[m, "status"] = "Open - with Engineering"
+        d.loc[m, "is_open"] = True
     return d
 
 
-def next_ids(d: pd.DataFrame) -> tuple[str, str]:
-    eng = pd.concat([d["eng_ticket_id"].dropna(), pd.Series([h["eng_id"] for h in session_log()], dtype=str)])
-    eng_n = pd.to_numeric(eng.str.extract(r"(\d+)")[0], errors="coerce").max()
-    sup_n = pd.to_numeric(d["ticket_id"].str.extract(r"(\d+)")[0], errors="coerce").max()
-    new_sup = len([h for h in session_log() if not h["existing"]])
-    return f"ENG-{int(eng_n) + 1}", f"SUP-{int(sup_n) + 1 + new_sup}"
+def next_eng_id(d: pd.DataFrame) -> str:
+    eng = pd.concat([d["eng_ticket_id"].dropna().astype(str), pd.Series([h["eng_id"] for h in session_log()], dtype=str)])
+    return f"ENG-{int(pd.to_numeric(eng.str.extract(r'(\d+)')[0], errors='coerce').max()) + 1}"
+
+
+def create_ticket(d: pd.DataFrame, snapshot: pd.Timestamp, client: str, category: str, desc: str, priority: str, channel: str) -> None:
+    sup_n = int(pd.to_numeric(d["ticket_id"].str.extract(r"(\d+)")[0], errors="coerce").max()) + 1
+    c = d[d["client_name"] == client].iloc[0]
+    row = {col: None for col in REQUIRED_COLUMNS}
+    row.update({
+        "ticket_id": f"SUP-{sup_n}", "created_at": snapshot - pd.Timedelta(minutes=1), "channel": channel, "client_id": c["client_id"],
+        "client_name": client, "client_tier": c["client_tier"], "category": category, "priority": priority, "description": desc,
+        "assigned_agent": "L1 (you)", "escalated_to_eng": "No", "eng_handoffs": 0, "status": "Open - with L1", "reopen_count": 0,
+    })
+    st.session_state.setdefault("new_tickets", []).append(row)
+    st.session_state["last_handoff"] = f"{row['ticket_id']} created for {client}. It is now in the open queue as Open - with L1."
 
 
 def hand_off(d: pd.DataFrame, ticket: dict, note: str, override: bool) -> None:
-    eng_id, new_sup = next_ids(d)
-    existing = ticket["id"] != "SUP-NEW"
-    tid = ticket["id"] if existing else new_sup
+    eng_id = next_eng_id(d)
     when = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %b %H:%M")
     session_log().append({
-        "time": when, "ticket": tid, "eng_id": eng_id, "client": ticket["client"], "category": ticket["category"],
-        "priority": ticket["priority"], "owner": ticket["owner"], "override": override, "existing": existing,
+        "time": when, "ticket": ticket["id"], "eng_id": eng_id, "client": ticket["client"], "category": ticket["category"],
+        "priority": ticket["priority"], "owner": ticket["owner"], "override": override,
         "handoff_no": ticket["handoffs"] + 1, "note": note,
     })
-    st.session_state["last_handoff"] = f"{tid} handed off to engineering as {eng_id} at {when} IST. Status is now Open - with Engineering."
+    st.session_state["last_handoff"] = f"{ticket['id']} handed off to engineering as {eng_id} at {when} IST. Status is now Open - with Engineering."
 
 
 def log_section() -> None:
@@ -381,12 +394,11 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
         client = c3.selectbox("Client", sorted(d["client_name"].unique()))
         priority = c4.selectbox("Priority", ["P1", "P2", "P3", "P4"], index=2)
         channel = c5.selectbox("Channel", sorted(d["channel"].unique()))
-        tier = d.loc[d["client_name"] == client, "client_tier"].iloc[0]
-        ticket = {
-            "id": "SUP-NEW", "client": client, "tier": tier, "category": category, "desc": desc,
-            "priority": priority, "channel": channel, "age": "new", "handoffs": 0, "reopens": 0,
-            "status": "Open - with L1", "owner": "You", "outcome": "",
-        }
+        if st.button("Create ticket", type="primary"):
+            create_ticket(d, snapshot, client, category, desc, priority, channel)
+            st.rerun()
+        st.caption("The ticket is added to the open queue as Open - with L1. Switch to Open tickets to work it and hand it off.")
+        return
 
     st.divider()
     left, right = st.columns([1, 1.15], gap="large")
@@ -494,7 +506,7 @@ def lead_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
     esc = d[d["esc"]]
     k = st.columns(5)
     k[0].markdown(tile("Open now", str(len(op)), f"{(op['status'] == 'Open - with Engineering').sum()} with engineering"), unsafe_allow_html=True)
-    k[1].markdown(tile("Avoidable handoff rate", f"{esc['returned'].mean():.0%}", "escalations returned for config or missing info"), unsafe_allow_html=True)
+    k[1].markdown(tile("Avoidable handoff rate", f"{esc[esc['eng_outcome'].notna()]['returned'].mean():.0%}", "escalations returned for config or missing info"), unsafe_allow_html=True)
     k[2].markdown(tile("Median close, escalated", f"{esc['ttr_h'].median():.0f} h", f"L1-only: {d[~d['esc']]['ttr_h'].median():.0f} h"), unsafe_allow_html=True)
     k[3].markdown(tile("Reopen rate", f"{d['reopened'].mean():.1%}", "guardrail"), unsafe_allow_html=True)
     k[4].markdown(tile("CSAT", f"{d['csat_score'].mean():.2f}", "guardrail, 1 to 5"), unsafe_allow_html=True)
@@ -514,7 +526,7 @@ def lead_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
         ee = x[x["esc"]]
         rows.append({
             "Agent": a, "Tickets": len(x), "Escalation %": x["esc"].mean() * 100,
-            "Returned % of escalations": ee["returned"].mean() * 100 if len(ee) else 0,
+            "Returned % of escalations": ee[ee["eng_outcome"].notna()]["returned"].mean() * 100 if ee["eng_outcome"].notna().any() else 0,
             "Reopen %": x["reopened"].mean() * 100, "CSAT": x["csat_score"].mean(),
             "Median close (h)": x["ttr_h"].median(),
         })
@@ -610,22 +622,23 @@ def diagnosis_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
 # ----------------------------------------------------------------------------
 st.sidebar.markdown("## RideOps Support Console")
 st.sidebar.caption("v0 · internal")
-df = load()
-if df is not None:
-    df = apply_session(df)
+base_df = load()
+df = apply_session(base_df) if base_df is not None else None
 if df is None:
     st.title("RideOps Support Console")
     st.info("Upload the ticket CSV in the sidebar to begin, or place it at `data/rideops_support_tickets.csv`.")
     st.stop()
 
-snapshot = df["created_at"].max().normalize() + pd.Timedelta(days=1)
+snapshot = base_df["created_at"].max().normalize() + pd.Timedelta(days=1)
 view = st.sidebar.radio("View", ["L1 Escalation Gate", "Lead Radar", "Diagnosis and plan"])
 
 op_now = int(df["is_open"].sum())
 st.sidebar.divider()
 st.sidebar.metric("Open tickets", op_now)
 st.sidebar.metric("Handed off this session", len(session_log()))
-st.sidebar.metric("Avoidable handoff rate", f"{df[df['esc']]['returned'].mean():.0%}", help="Escalations returned to L1 as config or missing info. Target below 15%.")
+if st.session_state.get("new_tickets"):
+    st.sidebar.caption(f"{len(st.session_state['new_tickets'])} ticket(s) created this session")
+st.sidebar.metric("Avoidable handoff rate", f"{df[df['esc'] & df['eng_outcome'].notna()]['returned'].mean():.0%}", help="Escalations returned to L1 as config or missing info. Target below 15%.")
 st.sidebar.caption(f"{len(df):,} tickets · data to {(snapshot - pd.Timedelta(days=1)).date()}")
 
 if view == "L1 Escalation Gate":
@@ -634,4 +647,4 @@ if view == "L1 Escalation Gate":
 elif view == "Lead Radar":
     lead_view(df, snapshot)
 else:
-    diagnosis_view(df, snapshot)
+    diagnosis_view(base_df, snapshot)

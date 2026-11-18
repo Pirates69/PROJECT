@@ -221,13 +221,25 @@ def weekly(d: pd.DataFrame, snapshot: pd.Timestamp) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def line(df: pd.DataFrame, col: str, height: int = 190) -> alt.Chart:
-    return (
+TARGETS = {"Avoidable handoff rate %": (15, "target 15%"), "Reopen rate %": (10, "guardrail 10%")}
+
+
+def line(df: pd.DataFrame, col: str, height: int = 190, pilot: pd.Timestamp | None = None) -> alt.Chart:
+    base = (
         alt.Chart(df)
         .mark_line(point=True, color="#3b82c4")
         .encode(x=alt.X("week:T", title=None), y=alt.Y(f"{col}:Q", title=None, scale=alt.Scale(zero=False)), tooltip=["week:T", col])
-        .properties(height=height, title=col)
     )
+    layers = [base]
+    if col in TARGETS:
+        val, label = TARGETS[col]
+        tdf = pd.DataFrame({"y": [val], "label": [label]})
+        layers.append(alt.Chart(tdf).mark_rule(strokeDash=[5, 4], color="#2e9e6b").encode(y="y:Q"))
+        layers.append(alt.Chart(tdf).mark_text(align="left", dx=4, dy=-6, color="#2e9e6b", fontSize=11).encode(y="y:Q", text="label:N", x=alt.value(4)))
+    if pilot is not None:
+        pdf = pd.DataFrame({"x": [pilot]})
+        layers.append(alt.Chart(pdf).mark_rule(color="#c8453b").encode(x="x:T"))
+    return alt.layer(*layers).properties(height=height, title=col)
 
 
 # ----------------------------------------------------------------------------
@@ -269,8 +281,8 @@ def session_log() -> list[dict]:
     return st.session_state.setdefault("handoff_log", [])
 
 
-def apply_session(d: pd.DataFrame) -> pd.DataFrame:
-    """Reflect this session's new tickets and handoffs in the data (simulated, session only)."""
+def apply_session(d: pd.DataFrame, snapshot: pd.Timestamp) -> pd.DataFrame:
+    """Reflect this session's new tickets, handoffs and engineering responses in the data (simulated, session only)."""
     new = st.session_state.get("new_tickets", [])
     log = session_log()
     if not new and not log:
@@ -279,14 +291,28 @@ def apply_session(d: pd.DataFrame) -> pd.DataFrame:
     if new:
         add = prepare(pd.DataFrame(new)[REQUIRED_COLUMNS])
         d = pd.concat([d, add], ignore_index=True)
+    now = snapshot - pd.Timedelta(minutes=1)
     for h in log:
         m = d["ticket_id"] == h["ticket"]
-        d.loc[m, "escalated_to_eng"] = "Yes"
-        d.loc[m, "esc"] = True
-        d.loc[m, "eng_ticket_id"] = h["eng_id"]
-        d.loc[m, "eng_handoffs"] = d.loc[m, "eng_handoffs"] + 1
-        d.loc[m, "status"] = "Open - with Engineering"
-        d.loc[m, "is_open"] = True
+        if h["action"] in ("Handed off", "Linked to known issue"):
+            d.loc[m, "escalated_to_eng"] = "Yes"
+            d.loc[m, "esc"] = True
+            d.loc[m, "eng_ticket_id"] = h["eng_id"]
+            d.loc[m, "eng_handoffs"] = d.loc[m, "eng_handoffs"] + 1
+            d.loc[m, "status"] = "Open - with Engineering"
+            d.loc[m, "is_open"] = True
+        elif h["action"] == "Engineering response":
+            d.loc[m, "eng_outcome"] = h["outcome"]
+            d.loc[m, "returned"] = h["outcome"] in RETURNED
+            if h["outcome"] in RETURNED:
+                d.loc[m, "status"] = "Open - with L1"
+                d.loc[m, "is_open"] = True
+            else:
+                d.loc[m, "status"] = "Closed"
+                d.loc[m, "is_open"] = False
+                d.loc[m, "first_closed_at"] = now
+                d.loc[m, "final_closed_at"] = now
+                d.loc[m, "ttr_h"] = (now - d.loc[m, "created_at"]).dt.total_seconds() / 3600
     return d
 
 
@@ -308,31 +334,56 @@ def create_ticket(d: pd.DataFrame, snapshot: pd.Timestamp, client: str, category
     st.session_state["last_handoff"] = f"{row['ticket_id']} created for {client}. It is now in the open queue as Open - with L1."
 
 
-def hand_off(d: pd.DataFrame, ticket: dict, note: str, override: bool) -> None:
-    eng_id = next_eng_id(d)
+def _log(action: str, ticket: dict, eng_id: str, detail: str = "", override: bool = False, note: str = "", outcome: str = "") -> str:
     when = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %b %H:%M")
     session_log().append({
-        "time": when, "ticket": ticket["id"], "eng_id": eng_id, "client": ticket["client"], "category": ticket["category"],
-        "priority": ticket["priority"], "owner": ticket["owner"], "override": override,
-        "handoff_no": ticket["handoffs"] + 1, "note": note,
+        "time": when, "action": action, "ticket": ticket["id"], "eng_id": eng_id, "client": ticket["client"],
+        "category": ticket["category"], "priority": ticket["priority"], "owner": ticket["owner"], "override": override,
+        "detail": detail, "note": note, "outcome": outcome,
     })
+    return when
+
+
+def hand_off(d: pd.DataFrame, ticket: dict, note: str, override: bool) -> None:
+    eng_id = next_eng_id(d)
+    when = _log("Handed off", ticket, eng_id, f"Handoff #{ticket['handoffs'] + 1}", override, note)
     st.session_state["last_handoff"] = f"{ticket['id']} handed off to engineering as {eng_id} at {when} IST. Status is now Open - with Engineering."
+
+
+def link_known_issue(ticket: dict, eng_id: str) -> None:
+    when = _log("Linked to known issue", ticket, eng_id, "No new engineering ticket created")
+    st.session_state["last_handoff"] = f"{ticket['id']} linked to the existing {eng_id} at {when} IST. No new engineering ticket was created."
+
+
+def record_response(ticket: dict, outcome: str) -> None:
+    eng_id = ticket.get("eng_id") or "-"
+    _log("Engineering response", ticket, eng_id, outcome, outcome=outcome)
+    if outcome in RETURNED:
+        st.session_state["last_handoff"] = f"{ticket['id']}: engineering returned it ({outcome}). It is back with L1."
+    else:
+        st.session_state["last_handoff"] = f"{ticket['id']}: engineering responded ({outcome}). Ticket closed."
+
+
+def known_issue_matches(d: pd.DataFrame, ticket: dict, snapshot: pd.Timestamp) -> pd.DataFrame:
+    m = d[(d["description"] == ticket["desc"]) & (d["status"] == "Open - with Engineering") & d["eng_ticket_id"].notna() & (d["ticket_id"] != ticket["id"])].copy()
+    m["age_h"] = (snapshot - m["created_at"]).dt.total_seconds() / 3600
+    return m.drop_duplicates("eng_ticket_id").sort_values("created_at", ascending=False)
 
 
 def log_section() -> None:
     log = session_log()
     st.divider()
-    st.subheader("Handed off this session")
+    st.subheader("Activity this session")
     st.caption("v0 keeps this queue for the current session only. It is not connected to RideOps' engineering system.")
     if not log:
-        st.info("No handoffs yet. Complete a ticket's checks above and press Hand off to Engineering.")
+        st.info("No activity yet. Complete a ticket's checks above and press Hand off to Engineering.")
         return
     t = pd.DataFrame(log)
-    shown = t.rename(columns={"time": "Time (IST)", "ticket": "Ticket", "eng_id": "Eng ticket", "client": "Client", "category": "Category",
-                              "priority": "Priority", "owner": "Owner", "override": "Override", "handoff_no": "Handoff #"})
-    st.dataframe(shown[["Time (IST)", "Ticket", "Eng ticket", "Client", "Category", "Priority", "Handoff #", "Owner", "Override"]], hide_index=True, width="stretch")
+    shown = t.rename(columns={"time": "Time (IST)", "action": "Action", "ticket": "Ticket", "eng_id": "Eng ticket", "client": "Client", "category": "Category",
+                              "priority": "Priority", "detail": "Detail", "override": "Override"})
+    st.dataframe(shown[["Time (IST)", "Action", "Ticket", "Eng ticket", "Client", "Category", "Priority", "Detail", "Override"]], hide_index=True, width="stretch")
     c1, c2 = st.columns(2)
-    c1.download_button("Download handoff log (CSV)", t.to_csv(index=False).encode(), "handoff_log.csv", "text/csv")
+    c1.download_button("Download activity log (CSV)", t.to_csv(index=False).encode(), "activity_log.csv", "text/csv")
     updated = st.session_state.get("updated_csv")
     if updated is not None:
         c2.download_button("Download tickets CSV with these changes", updated, "rideops_support_tickets_updated.csv", "text/csv")
@@ -353,6 +404,14 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
     st.caption("Check what happened to similar tickets, finish the checklist, then hand off with a note engineering can act on.")
     if msg := st.session_state.pop("last_handoff", None):
         st.success(msg)
+    with st.expander("How to use this page"):
+        st.markdown(
+            "1. Pick an open ticket, or create a new one.\n"
+            "2. Read the verdict. It comes from how similar tickets ended before.\n"
+            "3. If engineering already has the same issue open, link to it instead of raising a new ticket.\n"
+            "4. Otherwise finish the checklist and identifiers, then hand off. The note tells engineering exactly what you checked.\n"
+            "5. For tickets already with engineering, record their response to see the effect on the scorecard (simulated in v0)."
+        )
     mode = st.radio("Mode", ["Open tickets", "New ticket"], horizontal=True, label_visibility="collapsed")
 
     if mode == "Open tickets":
@@ -384,6 +443,7 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
             "desc": t.description, "priority": t.priority, "channel": t.channel,
             "age": f"{t.age_h:.0f} h", "handoffs": int(t.eng_handoffs), "reopens": int(t.reopen_count),
             "status": t.status, "owner": t.assigned_agent, "outcome": t.eng_outcome if isinstance(t.eng_outcome, str) else "",
+            "eng_id": t.eng_ticket_id if isinstance(t.eng_ticket_id, str) else "",
         }
     else:
         c1, c2 = st.columns(2)
@@ -418,6 +478,17 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
         cls, title, why = verdict(h, len(h["issue"]))
         st.markdown(f'<div class="verdict {cls}"><b>{title}</b>{why}</div>', unsafe_allow_html=True)
 
+        if ticket["status"] == "Open - with L1":
+            kn = known_issue_matches(d, ticket, snapshot)
+            if len(kn):
+                st.warning(f"**Known issue.** {len(kn)} open engineering ticket(s) already cover this exact issue. Link this client to one instead of raising a new ticket.")
+                ids = kn["eng_ticket_id"].tolist()
+                info = {r.eng_ticket_id: f"{r.eng_ticket_id} · from {r.ticket_id} ({r.client_name}), open {r.age_h:.0f} h" for r in kn.itertuples()}
+                pick = st.selectbox("Existing engineering ticket", ids, format_func=info.get, key=f"{ticket['id']}-ki")
+                if st.button("Link to known issue", key=f"{ticket['id']}-link"):
+                    link_known_issue(ticket, pick)
+                    st.rerun()
+
         st.markdown(f"**What happened to {h['scope_label']} before** ({h['esc_n']} escalated tickets)")
         if h["esc_n"]:
             mix = h["mix"].rename_axis("Outcome").reset_index(name="Tickets")
@@ -441,55 +512,63 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
 
     with right:
         key = ticket["id"] + ticket["desc"]
-        st.subheader("Before you hand off")
-        checks = [st.checkbox(item, key=f"{key}-c{i}") for i, item in enumerate(CHECKLISTS.get(ticket["category"], []))]
-        st.markdown("**Identifiers engineering needs**")
-        idents = IDENTIFIERS.get(ticket["category"], DEFAULT_IDENTIFIERS)
-        cols = st.columns(len(idents))
-        vals = [cols[i].text_input(name, key=f"{key}-i{i}") for i, name in enumerate(idents)]
-        summary = st.text_area("What you checked and what you saw", key=f"{key}-s", height=100,
-                               placeholder="e.g. Cutoff set to 14:00 in config, roster still built at 16:00 for 6 Oct night shift.")
-        override = st.checkbox("P1 outage: escalate now, finish the note after", key=f"{key}-o")
-
-        missing = []
-        if not all(checks):
-            missing.append(f"{checks.count(False)} checklist item(s)")
-        if not all(len(v.strip()) >= 3 for v in vals):
-            missing.append("identifiers (at least 3 characters each)")
-        if len(summary.split()) < 5 or len(summary.strip()) < 25 or not looks_like_text(summary):
-            missing.append("investigation summary (a sentence of at least 5 real words)")
-        ready = not missing or override
-
-        if ready:
-            note = "\n".join(
-                [
-                    f"ESCALATION {ticket['id']}  |  {ticket['priority']}  |  {ticket['client']} ({ticket['tier']})",
-                    f"Category: {ticket['category']}",
-                    f"Issue: {ticket['desc']}",
-                    f"Previous engineering handoffs: {ticket['handoffs']}",
-                    "",
-                    *[f"{n}: {v.strip() or '(not provided)'}" for n, v in zip(idents, vals)],
-                    "",
-                    "Checked at L1:",
-                    *[f"  [{'x' if c else ' '}] {item}" for c, item in zip(checks, CHECKLISTS.get(ticket["category"], []))],
-                    "",
-                    f"L1 findings: {summary.strip() or '(to follow)'}",
-                    "",
-                    "Client needs: a confirmed cause and a date for a fix or workaround.",
-                    "If you return this, please name the one thing you need.",
-                ]
-            )
-            if ticket["status"] == "Open - with L1":
-                st.success("Ready to hand off." if not missing else "Override on. Missing: " + ", ".join(missing) + ".")
-                st.code(note, language=None, wrap_lines=True)
-                if st.button("Hand off to Engineering", type="primary", key=f"{key}-send"):
-                    hand_off(d, ticket, note, override and bool(missing))
+        if ticket["status"] != "Open - with L1":
+            st.subheader("With engineering")
+            eng_id = ticket["eng_id"] or None
+            st.info(f"Already with engineering{f' as {eng_id}' if eng_id else ''}. Chase for an ETA instead of escalating again.")
+            with st.expander("Engineering response (simulated)", expanded=True):
+                st.caption("In production this arrives from the engineering ticket. Record it here to see the scorecard move.")
+                outcome = st.selectbox("Outcome", OUTCOME_ORDER, key=f"{key}-oc")
+                if st.button("Record engineering response", key=f"{key}-resp"):
+                    record_response(ticket, outcome)
                     st.rerun()
-            else:
-                eng_id = next((h["eng_id"] for h in reversed(session_log()) if h["ticket"] == ticket["id"]), None)
-                st.info(f"Already with engineering{f' as {eng_id}' if eng_id else ''}. Chase for an ETA instead of escalating again.")
         else:
-            st.warning("Handoff note locked. Still needed: " + ", ".join(missing) + ".")
+            st.subheader("Before you hand off")
+            checks = [st.checkbox(item, key=f"{key}-c{i}") for i, item in enumerate(CHECKLISTS.get(ticket["category"], []))]
+            st.markdown("**Identifiers engineering needs**")
+            idents = IDENTIFIERS.get(ticket["category"], DEFAULT_IDENTIFIERS)
+            cols = st.columns(len(idents))
+            vals = [cols[i].text_input(name, key=f"{key}-i{i}") for i, name in enumerate(idents)]
+            summary = st.text_area("What you checked and what you saw", key=f"{key}-s", height=100,
+                                   placeholder="e.g. Cutoff set to 14:00 in config, roster still built at 16:00 for 6 Oct night shift.")
+            override = st.checkbox("P1 outage: escalate now, finish the note after", key=f"{key}-o")
+
+            missing = []
+            if not all(checks):
+                missing.append(f"{checks.count(False)} checklist item(s)")
+            if not all(len(v.strip()) >= 3 for v in vals):
+                missing.append("identifiers (at least 3 characters each)")
+            if len(summary.split()) < 5 or len(summary.strip()) < 25 or not looks_like_text(summary):
+                missing.append("investigation summary (a sentence of at least 5 real words)")
+            ready = not missing or override
+
+            if ready:
+                note = "\n".join(
+                    [
+                        f"ESCALATION {ticket['id']}  |  {ticket['priority']}  |  {ticket['client']} ({ticket['tier']})",
+                        f"Category: {ticket['category']}",
+                        f"Issue: {ticket['desc']}",
+                        f"Previous engineering handoffs: {ticket['handoffs']}",
+                        "",
+                        *[f"{n}: {v.strip() or '(not provided)'}" for n, v in zip(idents, vals)],
+                        "",
+                        "Checked at L1:",
+                        *[f"  [{'x' if c else ' '}] {item}" for c, item in zip(checks, CHECKLISTS.get(ticket["category"], []))],
+                        "",
+                        f"L1 findings: {summary.strip() or '(to follow)'}",
+                        "",
+                        "Client needs: a confirmed cause and a date for a fix or workaround.",
+                        "If you return this, please name the one thing you need.",
+                    ]
+                )
+                if ticket["status"] == "Open - with L1":
+                    st.success("Ready to hand off." if not missing else "Override on. Missing: " + ", ".join(missing) + ".")
+                    st.code(note, language=None, wrap_lines=True)
+                    if st.button("Hand off to Engineering", type="primary", key=f"{key}-send"):
+                        hand_off(d, ticket, note, override and bool(missing))
+                        st.rerun()
+            else:
+                st.warning("Handoff note locked. Still needed: " + ", ".join(missing) + ".")
 
 
 def _gate_footer(d: pd.DataFrame) -> None:
@@ -512,13 +591,32 @@ def lead_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
     k[4].markdown(tile("CSAT", f"{d['csat_score'].mean():.2f}", "guardrail, 1 to 5"), unsafe_allow_html=True)
     st.write("")
 
+    with st.expander("How to read this page"):
+        st.markdown(
+            "- **Primary measure:** avoidable handoff rate (green line is the 15% target).\n"
+            "- **Guardrails:** reopen rate, CSAT and first response. If these worsen while handoffs improve, the gain is not real.\n"
+            "- **Open ÷ weekly volume** separates a slower system from simply more tickets.\n"
+            "- **Pilot start date** adds a marker and a before/after table once the gate is rolled out."
+        )
     st.subheader("Weekly trend")
+    pilot = st.date_input("Pilot start date (optional)", value=None, min_value=w["week"].min().date(), max_value=w["week"].max().date(),
+                          help="Marks when the escalation gate went live and compares the weeks before and after.")
+    pilot_ts = pd.Timestamp(pilot) if pilot else None
     cols = ["Avoidable handoff rate %", "Median final close, escalated (h)", "Reopen rate %", "CSAT", "Median first response (h)", "Open ÷ weekly volume"]
     for row in range(0, len(cols), 3):
         cc = st.columns(3)
         for c, name in zip(cc, cols[row:row + 3]):
-            c.altair_chart(line(w, name), width="stretch")
+            c.altair_chart(line(w, name, pilot=pilot_ts), width="stretch")
     st.caption("Raw open count follows volume. Open ÷ weekly volume shows whether the system itself is slowing down.")
+    if pilot_ts is not None:
+        before, after = w[w["week"] < pilot_ts], w[w["week"] >= pilot_ts]
+        if before.empty or after.empty:
+            st.info("Pick a date with at least one full week on each side to compare.")
+        else:
+            rows = [{"Measure": c, f"Before ({len(before)} wk)": before[c].mean(), f"After ({len(after)} wk)": after[c].mean(), "Change": after[c].mean() - before[c].mean()}
+                    for c in cols[:5]]
+            st.dataframe(pd.DataFrame(rows).style.format({c: "{:.1f}" for c in ["Change"]} | {f"Before ({len(before)} wk)": "{:.1f}", f"After ({len(after)} wk)": "{:.1f}"}),
+                         hide_index=True, width="stretch")
 
     st.subheader("Agents")
     rows = []
@@ -605,7 +703,32 @@ def diagnosis_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
         "- **For leadership:** open tickets shown next to open ÷ weekly volume."
     )
 
-    st.markdown("### 4. Next four weeks")
+    st.markdown("### 4. What the fix could be worth")
+    done = esc[esc["eng_outcome"].notna()]
+    cur = done["returned"].mean()
+    c1, c2 = st.columns(2)
+    target = c1.slider("Target avoidable handoff rate", 5, max(int(cur * 100), 6), min(15, max(int(cur * 100), 6)), format="%d%%") / 100
+    p_l1 = c2.slider("Of avoided returns, share L1 can now resolve itself", 0, 100, 50, format="%d%%") / 100
+    ret = d[d["returned"]]
+    fixed1 = d[(d["eng_outcome"] == "Fixed") & (d["eng_handoffs"] == 1)]["ttr_h"].mean()
+    l1_mean = d[~d["esc"]]["ttr_h"].mean()
+    avoided = len(ret) * max(1 - target / cur, 0)
+    after_h = p_l1 * l1_mean + (1 - p_l1) * fixed1
+    saved_h = avoided * max(ret["ttr_h"].mean() - after_h, 0)
+    period_h = (snapshot - d["created_at"].min().normalize()).total_seconds() / 3600
+    avg_open = d["ttr_h"].sum() / period_h
+    k = st.columns(4)
+    k[0].markdown(tile("Returns avoided", f"{avoided:.0f}", f"of {len(ret)} over the period"), unsafe_allow_html=True)
+    k[1].markdown(tile("Ticket-hours saved", f"{saved_h:,.0f}", f"{ret['ttr_h'].mean():.0f} h to about {after_h:.0f} h each"), unsafe_allow_html=True)
+    k[2].markdown(tile("Fewer open tickets", f"{saved_h / period_h:.1f}", "on average, from hours saved ÷ period hours"), unsafe_allow_html=True)
+    k[3].markdown(tile("Share of average backlog", f"{saved_h / period_h / avg_open:.0%}", f"average open was about {avg_open:.0f}"), unsafe_allow_html=True)
+    st.caption(
+        "Indicative only. It assumes an avoided return takes the average time of a clean fix by engineering, or of an L1-only ticket for the share L1 now resolves. "
+        "Average open tickets is ticket-hours divided by hours in the period. This lever offsets part of the rise, not all of it, "
+        f"because volume grew {(m.loc[last, 'n'] / m.loc[first, 'n'] - 1):.0%}. The rest has to come from fewer tickets, for example fixing the known recurring issues."
+    )
+
+    st.markdown("### 5. Next four weeks")
     st.table(pd.DataFrame(
         [
             ["Week 1", "Validate checklists with the engineering manager. Build a known-issue list for the top roster and report-export problems."],
@@ -623,19 +746,22 @@ def diagnosis_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
 st.sidebar.markdown("## RideOps Support Console")
 st.sidebar.caption("v0 · internal")
 base_df = load()
-df = apply_session(base_df) if base_df is not None else None
+if base_df is not None:
+    snapshot = base_df["created_at"].max().normalize() + pd.Timedelta(days=1)
+    df = apply_session(base_df, snapshot)
+else:
+    df = None
 if df is None:
     st.title("RideOps Support Console")
     st.info("Upload the ticket CSV in the sidebar to begin, or place it at `data/rideops_support_tickets.csv`.")
     st.stop()
 
-snapshot = base_df["created_at"].max().normalize() + pd.Timedelta(days=1)
 view = st.sidebar.radio("View", ["L1 Escalation Gate", "Lead Radar", "Diagnosis and plan"])
 
 op_now = int(df["is_open"].sum())
 st.sidebar.divider()
 st.sidebar.metric("Open tickets", op_now)
-st.sidebar.metric("Handed off this session", len(session_log()))
+st.sidebar.metric("Handed off this session", sum(1 for h in session_log() if h["action"] == "Handed off"))
 if st.session_state.get("new_tickets"):
     st.sidebar.caption(f"{len(st.session_state['new_tickets'])} ticket(s) created this session")
 st.sidebar.metric("Avoidable handoff rate", f"{df[df['esc'] & df['eng_outcome'].notna()]['returned'].mean():.0%}", help="Escalations returned to L1 as config or missing info. Target below 15%.")

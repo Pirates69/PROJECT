@@ -324,11 +324,13 @@ def next_eng_id(d: pd.DataFrame) -> str:
 def create_ticket(d: pd.DataFrame, snapshot: pd.Timestamp, client: str, category: str, desc: str, priority: str, channel: str) -> None:
     sup_n = int(pd.to_numeric(d["ticket_id"].str.extract(r"(\d+)")[0], errors="coerce").max()) + 1
     c = d[d["client_name"] == client].iloc[0]
+    me = st.session_state.get("signed_in", "All agents")
+    owner = me if me != "All agents" else "L1 (you)"
     row = {col: None for col in REQUIRED_COLUMNS}
     row.update({
         "ticket_id": f"SUP-{sup_n}", "created_at": snapshot - pd.Timedelta(minutes=1), "channel": channel, "client_id": c["client_id"],
         "client_name": client, "client_tier": c["client_tier"], "category": category, "priority": priority, "description": desc,
-        "assigned_agent": "L1 (you)", "escalated_to_eng": "No", "eng_handoffs": 0, "status": "Open - with L1", "reopen_count": 0,
+        "assigned_agent": owner, "escalated_to_eng": "No", "eng_handoffs": 0, "status": "Open - with L1", "reopen_count": 0,
     })
     st.session_state.setdefault("new_tickets", []).append(row)
     st.session_state["last_handoff"] = f"{row['ticket_id']} created for {client}. It is now in the open queue as Open - with L1."
@@ -399,6 +401,41 @@ def looks_like_text(text: str) -> bool:
     return plausible / len(words) >= 0.6 and len(set(words)) >= 4
 
 
+def ticket_from_row(t: pd.Series) -> dict:
+    return {
+        "id": t["ticket_id"], "client": t["client_name"], "tier": t["client_tier"], "category": t["category"],
+        "desc": t["description"], "priority": t["priority"], "channel": t["channel"],
+        "age": f"{t['age_h']:.0f} h", "handoffs": int(t["eng_handoffs"]), "reopens": int(t["reopen_count"]),
+        "status": t["status"], "owner": t["assigned_agent"], "outcome": t["eng_outcome"] if isinstance(t["eng_outcome"], str) else "",
+        "eng_id": t["eng_ticket_id"] if isinstance(t["eng_ticket_id"], str) else "",
+    }
+
+
+def outcome_chart(h: dict) -> None:
+    if not h["esc_n"]:
+        return
+    mix = h["mix"].rename_axis("Outcome").reset_index(name="Tickets")
+    chart = (
+        alt.Chart(mix[mix["Tickets"] > 0])
+        .mark_bar()
+        .encode(
+            y=alt.Y("Outcome:N", sort=OUTCOME_ORDER, title=None, axis=alt.Axis(labelLimit=260)),
+            x=alt.X("Tickets:Q", title=None),
+            color=alt.Color("Outcome:N", scale=alt.Scale(domain=OUTCOME_ORDER, range=OUTCOME_COLORS), legend=None),
+            tooltip=["Outcome", "Tickets"],
+        )
+        .properties(height=200)
+    )
+    st.altair_chart(chart, width="stretch")
+
+
+def handoff_note_for(ticket_id: str) -> str | None:
+    for h in reversed(session_log()):
+        if h["ticket"] == ticket_id and h["action"] == "Handed off" and h.get("note"):
+            return h["note"]
+    return None
+
+
 def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
     st.title("L1 Escalation Gate")
     st.caption("Check what happened to similar tickets, finish the checklist, then hand off with a note engineering can act on.")
@@ -410,23 +447,26 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
             "2. Read the verdict. It comes from how similar tickets ended before.\n"
             "3. If engineering already has the same issue open, link to it instead of raising a new ticket.\n"
             "4. Otherwise finish the checklist and identifiers, then hand off. The note tells engineering exactly what you checked.\n"
-            "5. For tickets already with engineering, record their response to see the effect on the scorecard (simulated in v0)."
+            "5. Tickets waiting on engineering are read-only here. Engineers respond from their own queue (switch the role in the sidebar to try it)."
         )
     mode = st.radio("Mode", ["Open tickets", "New ticket"], horizontal=True, label_visibility="collapsed")
 
     if mode == "Open tickets":
         op = d[d["is_open"]].copy()
         op["age_h"] = (snapshot - op["created_at"]).dt.total_seconds() / 3600
-        c1, c2, c3 = st.columns(3)
+        me = st.session_state.get("signed_in", "All agents")
+        if me != "All agents":
+            op = op[op["assigned_agent"] == me]
+        c1, c2 = st.columns(2)
         cat_f = c1.selectbox("Category", ["All"] + sorted(op["category"].unique()))
-        st_f = c2.selectbox("Status", ["All"] + sorted(op["status"].unique()))
-        ag_f = c3.selectbox("Agent", ["All"] + sorted(op["assigned_agent"].unique()))
+        queue_f = c2.selectbox("Queue", ["With L1 (action needed)", "Waiting on engineering", "All open"])
+        st.caption(f"Showing {'the whole L1 team' if me == 'All agents' else me}'s tickets.")
         if cat_f != "All":
             op = op[op["category"] == cat_f]
-        if st_f != "All":
-            op = op[op["status"] == st_f]
-        if ag_f != "All":
-            op = op[op["assigned_agent"] == ag_f]
+        if queue_f == "With L1 (action needed)":
+            op = op[op["status"] == "Open - with L1"]
+        elif queue_f == "Waiting on engineering":
+            op = op[op["status"] == "Open - with Engineering"]
         op["_with_eng"] = op["status"].eq("Open - with Engineering")
         op = op.sort_values(["_with_eng", "eng_handoffs", "age_h"], ascending=[True, False, False])
         if op.empty:
@@ -438,13 +478,7 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
         }
         tid = st.selectbox("Ticket", list(labels), format_func=labels.get)
         t = op[op["ticket_id"] == tid].iloc[0]
-        ticket = {
-            "id": t.ticket_id, "client": t.client_name, "tier": t.client_tier, "category": t.category,
-            "desc": t.description, "priority": t.priority, "channel": t.channel,
-            "age": f"{t.age_h:.0f} h", "handoffs": int(t.eng_handoffs), "reopens": int(t.reopen_count),
-            "status": t.status, "owner": t.assigned_agent, "outcome": t.eng_outcome if isinstance(t.eng_outcome, str) else "",
-            "eng_id": t.eng_ticket_id if isinstance(t.eng_ticket_id, str) else "",
-        }
+        ticket = ticket_from_row(t)
     else:
         c1, c2 = st.columns(2)
         category = c1.selectbox("Category", sorted(d["category"].unique()))
@@ -490,20 +524,7 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
                     st.rerun()
 
         st.markdown(f"**What happened to {h['scope_label']} before** ({h['esc_n']} escalated tickets)")
-        if h["esc_n"]:
-            mix = h["mix"].rename_axis("Outcome").reset_index(name="Tickets")
-            chart = (
-                alt.Chart(mix[mix["Tickets"] > 0])
-                .mark_bar()
-                .encode(
-                    y=alt.Y("Outcome:N", sort=OUTCOME_ORDER, title=None, axis=alt.Axis(labelLimit=260)),
-                    x=alt.X("Tickets:Q", title=None),
-                    color=alt.Color("Outcome:N", scale=alt.Scale(domain=OUTCOME_ORDER, range=OUTCOME_COLORS), legend=None),
-                    tooltip=["Outcome", "Tickets"],
-                )
-                .properties(height=200)
-            )
-            st.altair_chart(chart, width="stretch")
+        outcome_chart(h)
         iss = h["issue"]
         k = st.columns(3)
         k[0].metric("Median, resolved at L1", f"{iss[~iss['esc']]['ttr_h'].median():.0f} h" if (~iss["esc"]).any() else "n/a")
@@ -513,15 +534,9 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
     with right:
         key = ticket["id"] + ticket["desc"]
         if ticket["status"] != "Open - with L1":
-            st.subheader("With engineering")
+            st.subheader("Waiting on engineering")
             eng_id = ticket["eng_id"] or None
-            st.info(f"Already with engineering{f' as {eng_id}' if eng_id else ''}. Chase for an ETA instead of escalating again.")
-            with st.expander("Engineering response (simulated)", expanded=True):
-                st.caption("In production this arrives from the engineering ticket. Record it here to see the scorecard move.")
-                outcome = st.selectbox("Outcome", OUTCOME_ORDER, key=f"{key}-oc")
-                if st.button("Record engineering response", key=f"{key}-resp"):
-                    record_response(ticket, outcome)
-                    st.rerun()
+            st.info(f"This ticket is with engineering{f' as {eng_id}' if eng_id else ''}. It is read-only for L1: engineers record the response from their own queue. Chase for an ETA instead of escalating again.")
         else:
             st.subheader("Before you hand off")
             checks = [st.checkbox(item, key=f"{key}-c{i}") for i, item in enumerate(CHECKLISTS.get(ticket["category"], []))]
@@ -569,6 +584,81 @@ def gate_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
                         st.rerun()
             else:
                 st.warning("Handoff note locked. Still needed: " + ", ".join(missing) + ".")
+
+
+def engineering_view(d: pd.DataFrame, snapshot: pd.Timestamp) -> None:
+    st.title("Engineering Queue")
+    st.caption("Tickets L1 has handed to engineering. Read the note, respond, and the ticket goes back to L1 or closes.")
+    if msg := st.session_state.pop("last_handoff", None):
+        st.success(msg)
+    with st.expander("How to use this page"):
+        st.markdown(
+            "1. Tickets are sorted by priority, then by how long they have waited.\n"
+            "2. Read the L1 handoff note. Tickets handed off in this app carry the full note.\n"
+            "3. Check how this issue ended before and whether other open tickets share it.\n"
+            "4. Record your response. A return sends it back to L1 and counts as an avoidable handoff, anything else closes it.\n"
+            "5. In production the response comes from your own ticketing tool. Recording it here is a simulation for v0."
+        )
+    q = d[d["status"] == "Open - with Engineering"].copy()
+    q["age_h"] = (snapshot - q["created_at"]).dt.total_seconds() / 3600
+    c1, c2 = st.columns(2)
+    cat_f = c1.selectbox("Category", ["All"] + sorted(q["category"].unique()))
+    pri_f = c2.selectbox("Priority", ["All", "P1", "P2", "P3", "P4"])
+    if cat_f != "All":
+        q = q[q["category"] == cat_f]
+    if pri_f != "All":
+        q = q[q["priority"] == pri_f]
+    q = q.sort_values(["priority", "age_h"], ascending=[True, False])
+    if q.empty:
+        st.success("Nothing is waiting on engineering for these filters.")
+        return
+    labels = {r.ticket_id: f"{r.eng_ticket_id} | {r.priority} | {r.category} | {r.client_name} | waiting {r.age_h:.0f} h | {r.ticket_id}" for r in q.itertuples()}
+    tid = st.selectbox("Engineering ticket", list(labels), format_func=labels.get)
+    ticket = ticket_from_row(q[q["ticket_id"] == tid].iloc[0])
+    h = history(d, ticket["category"], ticket["desc"])
+
+    st.divider()
+    left, right = st.columns([1.15, 1], gap="large")
+    with left:
+        st.subheader(f"{ticket['eng_id'] or 'Engineering ticket'}  ·  {ticket['client']}")
+        m = st.columns(4)
+        m[0].metric("Priority", ticket["priority"])
+        m[1].metric("Waiting", ticket["age"])
+        m[2].metric("Handoffs", ticket["handoffs"])
+        m[3].metric("Reopens", ticket["reopens"])
+        st.markdown(f"**{ticket['category']}**  \n{ticket['desc']}  \n{ticket['id']} · {ticket['tier']} · via {ticket['channel']} · raised by L1: {ticket['owner']}")
+        if ticket["outcome"]:
+            st.warning(f"Earlier verdict on this ticket: **{ticket['outcome']}**.")
+        st.markdown("**L1 handoff note**")
+        note = handoff_note_for(ticket["id"])
+        if note:
+            st.code(note, language=None, wrap_lines=True)
+        else:
+            st.caption("No handoff note on file. This ticket comes from the data file, which only records that it was handed off. Tickets handed off in this app carry the full L1 note here.")
+        same = known_issue_matches(d, ticket, snapshot)
+        if len(same):
+            st.markdown(f"**{len(same)} other open ticket(s) with the same issue**")
+            st.dataframe(
+                same[["eng_ticket_id", "ticket_id", "client_name", "priority", "age_h"]].rename(
+                    columns={"eng_ticket_id": "Eng ticket", "ticket_id": "L1 ticket", "client_name": "Client", "priority": "Priority", "age_h": "Waiting (h)"}
+                ).style.format({"Waiting (h)": "{:.0f}"}),
+                hide_index=True, width="stretch",
+            )
+            st.caption("A fix here may resolve these too.")
+    with right:
+        st.subheader("Respond")
+        outcome = st.selectbox("Outcome", OUTCOME_ORDER, key=f"{ticket['id']}-eng-oc")
+        if outcome in RETURNED:
+            st.caption("This sends the ticket back to L1 and counts as an avoidable handoff. Please name the one thing you need in the note.")
+        else:
+            st.caption("This closes the ticket.")
+        if st.button("Record response", type="primary", key=f"{ticket['id']}-eng-resp"):
+            record_response(ticket, outcome)
+            st.rerun()
+        st.markdown(f"**How this was resolved before** ({h['esc_n']} escalated tickets)")
+        outcome_chart(h)
+        iss = h["issue"]
+        st.caption(f"Median close when escalated: {iss[iss['esc']]['ttr_h'].median():.0f} h" if iss["esc"].any() else "No earlier escalations for this exact issue.")
 
 
 def _gate_footer(d: pd.DataFrame) -> None:
@@ -756,10 +846,25 @@ if df is None:
     st.info("Upload the ticket CSV in the sidebar to begin, or place it at `data/rideops_support_tickets.csv`.")
     st.stop()
 
-view = st.sidebar.radio("View", ["L1 Escalation Gate", "Lead Radar", "Diagnosis and plan"])
+ROLE_VIEWS = {
+    "L1 agent": ["L1 Escalation Gate"],
+    "Engineer": ["Engineering Queue"],
+    "Support lead": ["Lead Radar", "Diagnosis and plan"],
+}
+role = st.sidebar.selectbox("Role", list(ROLE_VIEWS), key="role", help="Each role sees only its own work. This is a demo switch, not a login.")
+if role == "L1 agent":
+    agents = ["All agents"] + sorted(set(df["assigned_agent"]) - {"L1 (you)"}) + ["L1 (you)"]
+    st.sidebar.selectbox("Signed in as", agents, key="signed_in")
+view = st.sidebar.radio("View", ROLE_VIEWS[role], key=f"view-{role}")
 
 op_now = int(df["is_open"].sum())
 st.sidebar.divider()
+if role == "L1 agent":
+    me = st.session_state.get("signed_in", "All agents")
+    mine = df[(df["status"] == "Open - with L1") & ((df["assigned_agent"] == me) | (me == "All agents"))]
+    st.sidebar.metric("Needs your action", len(mine), help="Open tickets with L1 that you can work or hand off.")
+elif role == "Engineer":
+    st.sidebar.metric("Waiting on engineering", int((df["status"] == "Open - with Engineering").sum()))
 st.sidebar.metric("Open tickets", op_now)
 st.sidebar.metric("Handed off this session", sum(1 for h in session_log() if h["action"] == "Handed off"))
 if st.session_state.get("new_tickets"):
@@ -769,6 +874,9 @@ st.sidebar.caption(f"{len(df):,} tickets · data to {(snapshot - pd.Timedelta(da
 
 if view == "L1 Escalation Gate":
     gate_view(df, snapshot)
+    _gate_footer(df)
+elif view == "Engineering Queue":
+    engineering_view(df, snapshot)
     _gate_footer(df)
 elif view == "Lead Radar":
     lead_view(df, snapshot)

@@ -2,23 +2,30 @@
 
 Internal tool built for the RideOps support case study. It targets one measure: **avoidable handoffs** (escalations that engineering returns to L1 for config or missing information).
 
-![L1 Escalation Gate](gate.png)
+![L1 Escalation Gate](docs/gate.png)
 
-| View | User | Purpose |
+Pick a **Role** in the sidebar. Each role sees only its own work (a demo switch, not a login):
+
+| Role | View | Purpose |
 |---|---|---|
-| L1 Escalation Gate | L1 agent | See how similar tickets ended, link to a known issue, finish a checklist, hand off with a note engineering can act on |
-| Lead Radar | Support lead | Backlog, weekly trend against targets, pilot before/after, agent coaching table |
-| Diagnosis and plan | Head of Ops | The numbers behind the diagnosis, the claims tested, an impact estimate and the four-week plan |
+| L1 agent | L1 Escalation Gate | Tickets with L1 only (filter by agent with "Signed in as"). See how similar tickets ended, link to a known issue, finish a checklist, hand off with a note engineering can act on. Tickets waiting on engineering are read-only. |
+| Engineer | Engineering Queue | Tickets handed to engineering, sorted by priority and wait. Read the L1 note, see how the issue ended before, respond. A return goes back to L1, anything else closes it. |
+| Support lead | Lead Radar, Diagnosis and plan | Backlog, weekly trend against targets, pilot before/after, agent coaching table, the diagnosis and an impact estimate. |
 
-![Lead Radar](lead-radar.png)
+![Lead Radar](docs/lead-radar.png)
+
+![Engineering Queue](docs/engineering-queue.png)
 
 ## What the L1 agent can do
 - **Verdict** from historical outcomes of the same issue (or its category when the issue has fewer than 10 escalations).
 - **Known-issue matcher**: if engineering already has the same issue open, link the ticket to it instead of raising a new one.
 - **Checklist, identifiers and findings** are required before the handoff note unlocks (P1 outage override available).
 - **Hand off to Engineering** creates a simulated engineering ID, moves the ticket to "Open - with Engineering" and logs it.
-- **Engineering response (simulated)** lets you record Fixed, Returned and so on, so the scorecard moves. Returned tickets come back to L1, others close.
-- **New ticket** adds a simulated open ticket to the queue.
+- **New ticket** adds a simulated open ticket to the queue, owned by the agent you are signed in as.
+
+## What the engineer can do
+- See the L1 handoff note (full note for tickets handed off in this app) and other open tickets with the same issue.
+- **Record response** (simulated): Fixed, Duplicate, How-to, Not reproducible close the ticket. Config issue or Insufficient info send it back to L1 and count as an avoidable handoff.
 - Activity log and an updated tickets CSV can be downloaded.
 
 All of this is session-only. Nothing is written to the CSV or to any external system. The Diagnosis view always uses the original file, so session activity never changes the case-study numbers.

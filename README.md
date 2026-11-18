@@ -2,7 +2,7 @@
 
 Internal tool built for the RideOps support case study. It targets one measure: **avoidable handoffs** (escalations that engineering returns to L1 for config or missing information).
 
-![L1 Escalation Gate](docs/gate.png)
+![L1 Escalation Gate](gate.png)
 
 | View | User | Purpose |
 |---|---|---|
@@ -10,7 +10,7 @@ Internal tool built for the RideOps support case study. It targets one measure: 
 | Lead Radar | Support lead | Backlog, weekly trend against targets, pilot before/after, agent coaching table |
 | Diagnosis and plan | Head of Ops | The numbers behind the diagnosis, the claims tested, an impact estimate and the four-week plan |
 
-![Lead Radar](docs/lead-radar.png)
+![Lead Radar](lead-radar.png)
 
 ## What the L1 agent can do
 - **Verdict** from historical outcomes of the same issue (or its category when the issue has fewer than 10 escalations).

@@ -14,7 +14,7 @@ Pick a **Role** in the sidebar. Each role sees only its own work (a demo switch,
 
 ![Lead Radar](lead-radar.png)
 
-![Engineering Queue](docs/engineering-queue.png)
+![Engineering Queue](engineering-queue.png)
 
 ## What the L1 agent can do
 - **Verdict** from historical outcomes of the same issue (or its category when the issue has fewer than 10 escalations).

@@ -2,7 +2,7 @@
 
 Internal tool built for the RideOps support case study. It targets one measure: **avoidable handoffs** (escalations that engineering returns to L1 for config or missing information).
 
-![L1 Escalation Gate](docs/gate.png)
+![L1 Escalation Gate](gate.png)
 
 Pick a **Role** in the sidebar. Each role sees only its own work (a demo switch, not a login):
 
@@ -12,7 +12,7 @@ Pick a **Role** in the sidebar. Each role sees only its own work (a demo switch,
 | Engineer | Engineering Queue | Tickets handed to engineering, sorted by priority and wait. Read the L1 note, see how the issue ended before, respond. A return goes back to L1, anything else closes it. |
 | Support lead | Lead Radar, Diagnosis and plan | Backlog, weekly trend against targets, pilot before/after, agent coaching table, the diagnosis and an impact estimate. |
 
-![Lead Radar](docs/lead-radar.png)
+![Lead Radar](lead-radar.png)
 
 ![Engineering Queue](docs/engineering-queue.png)
 

@@ -1,0 +1,4 @@
+__pycache__/
+.venv/
+# The case-study data is confidential: keep it out of a public repo.
+data/*.csv
